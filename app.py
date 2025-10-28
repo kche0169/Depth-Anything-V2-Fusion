@@ -85,4 +85,4 @@ with gr.Blocks(css=css) as demo:
 
 
 if __name__ == '__main__':
-    demo.queue().launch()
+    demo.queue().launch(server_port=6006)
