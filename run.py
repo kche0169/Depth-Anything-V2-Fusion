@@ -20,6 +20,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--pred-only', dest='pred_only', action='store_true', help='only display the prediction')
     parser.add_argument('--grayscale', dest='grayscale', action='store_true', help='do not apply colorful palette')
+    parser.add_argument('--radar-dir', type=str, default=None, help='directory that contains radar .mat files aligned to images')
     
     args = parser.parse_args()
     
@@ -53,8 +54,15 @@ if __name__ == '__main__':
         print(f'Progress {k+1}/{len(filenames)}: {filename}')
         
         raw_image = cv2.imread(filename)
-        
-        depth = depth_anything.infer_image(raw_image, args.input_size)
+        radar_path = None
+        if args.radar_dir is not None:
+            # try to find matching radar .mat by filename (stem)
+            stem = os.path.splitext(os.path.basename(filename))[0]
+            candidate = os.path.join(args.radar_dir, stem + '.mat')
+            if os.path.exists(candidate):
+                radar_path = candidate
+
+        depth = depth_anything.infer_image(raw_image, args.input_size, radar_path=radar_path)
         
         depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
         depth = depth.astype(np.uint8)

@@ -7,6 +7,8 @@ from torchvision.transforms import Compose
 from .dinov2 import DINOv2
 from .util.blocks import FeatureFusionBlock, _make_scratch
 from .util.transform import Resize, NormalizeImage, PrepareForNet
+from .radar import RadarEncoder, load_radar_mat
+from .fusion import ConcatFusion, SEFusion, CrossAttentionFusion
 
 
 def _make_fusion_block(features, use_bn, size=None):
@@ -37,17 +39,17 @@ class ConvBlock(nn.Module):
 
 class DPTHead(nn.Module):
     def __init__(
-        self, 
-        in_channels, 
-        features=256, 
-        use_bn=False, 
-        out_channels=[256, 512, 1024, 1024], 
-        use_clstoken=False
+        self,
+        in_channels,
+        features=256,
+        use_bn=False,
+        out_channels=[256, 512, 1024, 1024],
+        use_clstoken=False,
     ):
         super(DPTHead, self).__init__()
-        
+
         self.use_clstoken = use_clstoken
-        
+
         self.projects = nn.ModuleList([
             nn.Conv2d(
                 in_channels=in_channels,
@@ -57,7 +59,7 @@ class DPTHead(nn.Module):
                 padding=0,
             ) for out_channel in out_channels
         ])
-        
+
         self.resize_layers = nn.ModuleList([
             nn.ConvTranspose2d(
                 in_channels=out_channels[0],
@@ -114,7 +116,7 @@ class DPTHead(nn.Module):
             nn.Identity(),
         )
     
-    def forward(self, out_features, patch_h, patch_w):
+    def forward(self, out_features, patch_h, patch_w, radar_feats=None, fusions=None):
         out = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
@@ -125,7 +127,15 @@ class DPTHead(nn.Module):
                 x = x[0]
             
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
-            
+            # optionally fuse radar features at this level
+            if radar_feats is not None and fusions is not None and fusions[i] is not None:
+                # radar_feats expected to be list of spatial tensors aligned to this level
+                try:
+                    x = fusions[i](x, radar_feats[i])
+                except Exception:
+                    # fallback: ignore fusion if mismatch
+                    pass
+
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             
@@ -152,12 +162,14 @@ class DPTHead(nn.Module):
 
 class DepthAnythingV2(nn.Module):
     def __init__(
-        self, 
-        encoder='vitl', 
-        features=256, 
-        out_channels=[256, 512, 1024, 1024], 
-        use_bn=False, 
-        use_clstoken=False
+        self,
+        encoder='vitl',
+        features=256,
+        out_channels=[256, 512, 1024, 1024],
+        use_bn=False,
+        use_clstoken=False,
+        fusion_type=None,
+        radar_in_ch=1,
     ):
         super(DepthAnythingV2, self).__init__()
         
@@ -172,22 +184,49 @@ class DepthAnythingV2(nn.Module):
         self.pretrained = DINOv2(model_name=encoder)
         
         self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken)
+
+        # Fusion setup: optional radar encoder and fusion modules
+        self.fusion_type = fusion_type
+        if fusion_type is not None:
+            self.radar_encoder = RadarEncoder(in_ch=radar_in_ch, features=[32, 64, 128])
+            num_levels = len(self.depth_head.projects)
+            fusions = [None] * num_levels
+            embed_dim = self.pretrained.embed_dim
+            radar_sizes = [32, 64, 128]
+            fuse_indices = [1, 2]
+            for idx, rch in zip(fuse_indices, radar_sizes[:len(fuse_indices)]):
+                if fusion_type == 'concat':
+                    fusions[idx] = ConcatFusion(in_ch_v=embed_dim, in_ch_r=rch, out_ch=embed_dim)
+                elif fusion_type == 'se':
+                    fusions[idx] = SEFusion(in_ch_v=embed_dim, in_ch_r=rch)
+                elif fusion_type == 'cross':
+                    fusions[idx] = CrossAttentionFusion(in_ch_v=embed_dim, in_ch_r=rch)
+                else:
+                    fusions[idx] = None
+            self.fusions = nn.ModuleList(fusions)
     
-    def forward(self, x):
-        patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
-        
-        features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
-        
-        depth = self.depth_head(features, patch_h, patch_w)
-        depth = F.relu(depth)
-        
-        return depth.squeeze(1)
+    
     
     @torch.no_grad()
-    def infer_image(self, raw_image, input_size=518):
+    def infer_image(self, raw_image, input_size=518, radar_path=None):
         image, (h, w) = self.image2tensor(raw_image, input_size)
-        
-        depth = self.forward(image)
+        radar_tensor = None
+        radar_feats = None
+        fusions = None
+        if radar_path is not None:
+            # try to load .mat and create sparse depth map
+            try:
+                # project radar to input_size
+                depth_map, mask = load_radar_mat(radar_path, resize_to=(input_size, input_size))
+                # create tensor Bx1xH x W
+                radar_tensor = torch.from_numpy(depth_map[None, None]).float().to(image.device)
+            except Exception:
+                radar_tensor = None
+
+        if radar_tensor is not None:
+            depth = self.forward(image, radar=radar_tensor)
+        else:
+            depth = self.forward(image)
         
         depth = F.interpolate(depth[:, None], (h, w), mode="bilinear", align_corners=True)[0, 0]
         
@@ -219,3 +258,24 @@ class DepthAnythingV2(nn.Module):
         image = image.to(DEVICE)
         
         return image, (h, w)
+
+    def forward(self, x, radar=None):
+        """Override to accept optional radar tensor of shape (B, C, H, W) aligned to input_size."""
+        patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
+
+        features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
+
+        # if radar provided, compute radar_feats via radar_encoder and build fusion modules in __init__
+        radar_feats = None
+        fusions = None
+        if hasattr(self, 'radar_encoder') and radar is not None:
+            # radar: BxC x H x W
+            radar_feats = self.radar_encoder(radar)
+            # radar_feats is a list from shallow to deep; need to align order with out_features
+            # Build a list of spatial tensors matching out_features count (pad/trim as necessary)
+            # Here we will upsample radar_feats to match feature spatial sizes inside DPTHead
+            fusions = self.fusions if hasattr(self, 'fusions') else None
+
+        depth = self.depth_head(features, patch_h, patch_w, radar_feats=radar_feats, fusions=fusions)
+        depth = F.relu(depth)
+        return depth.squeeze(1)
