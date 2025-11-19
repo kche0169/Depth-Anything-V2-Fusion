@@ -70,6 +70,68 @@ def load_radar_mat(mat_path, out_size=None, cam_intrinsics_path='parameters/Came
     return depth_map, mask
 
 
+def load_radar_file(fpath, resize_to=None):
+    """
+    Generic radar file loader. Assumes a simple text file format where each line is a point.
+    The projection logic here is a placeholder and might need real camera intrinsics.
+    """
+    try:
+        # This assumes a text file where columns might be separated by space or comma.
+        # It tries to load points, expecting at least 3 columns (x, y, z).
+        points = np.loadtxt(fpath, delimiter=',')
+    except Exception:
+        try:
+            points = np.loadtxt(fpath) # Fallback to space delimiter
+        except Exception as e:
+            # print(f"Could not load radar file {fpath}: {e}")
+            return _get_zero_tensors(resize_to)
+
+    return _process_radar_points(points, resize_to)
+
+def _process_radar_points(points, resize_to):
+    """
+    Projects an array of 3D points into a sparse depth map.
+    This function contains placeholder camera intrinsics.
+    """
+    if points.ndim == 1 and points.shape[0] >= 3:
+        points = np.expand_dims(points, axis=0)
+    elif points.ndim != 2 or points.shape[1] < 3:
+        # print(f"Invalid radar points shape: {points.shape}")
+        return _get_zero_tensors(resize_to)
+
+    h, w = resize_to if resize_to else (480, 640)
+    depth_map = np.zeros((h, w), dtype=np.float32)
+    mask = np.zeros((h, w), dtype=np.float32)
+
+    # --- Placeholder Camera Intrinsics ---
+    # These should be replaced with your actual camera parameters.
+    fx, fy = 960, 960  # Focal length
+    cx, cy = w / 2, h / 2  # Principal point
+    # --- End Placeholder ---
+
+    # Assuming points are in camera coordinate system (x-right, y-down, z-forward)
+    for p in points:
+        x, y, z = p[0], p[1], p[2]
+        
+        if z > 0.5:  # Filter points behind or too close to the camera
+            # Project 3D point to 2D pixel
+            u = int(fx * x / z + cx)
+            v = int(fy * y / z + cy)
+
+            if 0 <= u < w and 0 <= v < h:
+                # If multiple points map to the same pixel, keep the one with the smallest depth
+                if mask[v, u] == 0 or z < depth_map[v, u]:
+                    depth_map[v, u] = z
+                    mask[v, u] = 1
+    
+    return torch.from_numpy(depth_map).unsqueeze(0), torch.from_numpy(mask).unsqueeze(0)
+
+def _get_zero_tensors(resize_to):
+    """Returns zero tensors for depth and mask if radar loading fails."""
+    h, w = resize_to if resize_to else (480, 640)
+    return torch.zeros((1, h, w), dtype=torch.float32), torch.zeros((1, h, w), dtype=torch.float32)
+
+
 class RadarEncoder(nn.Module):
     """Lightweight CNN encoder that returns multi-scale radar features to fuse with visual features."""
     def __init__(self, in_ch=1, features=[32, 64, 128]):

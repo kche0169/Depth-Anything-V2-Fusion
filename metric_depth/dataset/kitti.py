@@ -4,6 +4,8 @@ from torch.utils.data import Dataset
 from torchvision.transforms import Compose
 
 from dataset.transform import Resize, NormalizeImage, PrepareForNet
+from depth_anything_v2.radar import load_radar_mat
+import os
 
 
 class KITTI(Dataset):
@@ -33,8 +35,10 @@ class KITTI(Dataset):
         ])
     
     def __getitem__(self, item):
-        img_path = self.filelist[item].split(' ')[0]
-        depth_path = self.filelist[item].split(' ')[1]
+        parts = self.filelist[item].split(' ')
+        img_path = parts[0]
+        depth_path = parts[1]
+        radar_path = parts[2] if len(parts) > 2 and parts[2] not in ('-', 'None', '') else None
         
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) / 255.0
@@ -49,7 +53,20 @@ class KITTI(Dataset):
         
         sample['valid_mask'] = sample['depth'] > 0
         
-        sample['image_path'] = self.filelist[item].split(' ')[0]
+        sample['image_path'] = parts[0]
+        # optionally load radar if present
+        if radar_path:
+            try:
+                rp = radar_path if os.path.isabs(radar_path) else os.path.join(os.path.dirname(os.path.dirname(__file__)), radar_path)
+                rd_map, rm_mask = load_radar_mat(rp, resize_to=(self.size[1], self.size[0]))
+                sample['radar_depth'] = torch.from_numpy(rd_map).unsqueeze(0).float()
+                sample['radar_mask'] = torch.from_numpy(rm_mask).unsqueeze(0).float()
+            except Exception:
+                sample['radar_depth'] = torch.zeros((1, self.size[1], self.size[0]), dtype=torch.float32)
+                sample['radar_mask'] = torch.zeros((1, self.size[1], self.size[0]), dtype=torch.float32)
+        else:
+            sample['radar_depth'] = torch.zeros((1, self.size[1], self.size[0]), dtype=torch.float32)
+            sample['radar_mask'] = torch.zeros((1, self.size[1], self.size[0]), dtype=torch.float32)
         
         return sample
 

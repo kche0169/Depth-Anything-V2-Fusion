@@ -1,5 +1,6 @@
 import os
 import cv2
+import torch
 from depth_anything_v2.dpt import DepthAnythingV2
 
 def main():
@@ -12,6 +13,8 @@ def main():
         img_path = os.path.join('assets/examples', imgs[0])
 
     model = DepthAnythingV2()
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+    model.to(DEVICE)
     model.eval()
     img = cv2.imread(img_path)
     depth = model.infer_image(img)

@@ -3,6 +3,10 @@ import logging
 import os
 import pprint
 import random
+import sys
+
+# Add project root to python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import warnings
 import numpy as np
@@ -17,7 +21,9 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset.hypersim import Hypersim
 from dataset.kitti import KITTI
 from dataset.vkitti2 import VKITTI2
+from dataset.custom_dataset import CustomDataset
 from depth_anything_v2.dpt import DepthAnythingV2
+from depth_anything_v2.radar import load_radar_mat
 from util.dist_helper import setup_distributed
 from util.loss import SiLogLoss
 from util.metric import eval_depth
@@ -27,7 +33,7 @@ from util.utils import init_log
 parser = argparse.ArgumentParser(description='Depth Anything V2 for Metric Depth Estimation')
 
 parser.add_argument('--encoder', default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
-parser.add_argument('--dataset', default='hypersim', choices=['hypersim', 'vkitti'])
+parser.add_argument('--dataset', default='hypersim', choices=['hypersim', 'vkitti', 'custom'])
 parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=0.001, type=float)
 parser.add_argument('--max-depth', default=20, type=float)
@@ -38,6 +44,9 @@ parser.add_argument('--pretrained-from', type=str)
 parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
+parser.add_argument('--fusion-type', default=None, choices=[None, 'concat', 'se', 'cross'], help='Fusion operator to use (radar fusion)')
+parser.add_argument('--radar-dir', default=None, type=str, help='Directory containing radar .mat files (optional)')
+parser.add_argument('--radar-consistency-weight', default=0.0, type=float, help='Weight for radar-consistency MSE loss')
 
 
 def main():
@@ -63,6 +72,9 @@ def main():
         trainset = Hypersim('dataset/splits/hypersim/train.txt', 'train', size=size)
     elif args.dataset == 'vkitti':
         trainset = VKITTI2('dataset/splits/vkitti2/train.txt', 'train', size=size)
+    elif args.dataset == 'custom':
+        train_split_file = 'dataset/splits_with_radar/train.txt'
+        trainset = CustomDataset(train_split_file, height=args.img_size, width=args.img_size)
     else:
         raise NotImplementedError
     trainsampler = torch.utils.data.distributed.DistributedSampler(trainset)
@@ -72,6 +84,9 @@ def main():
         valset = Hypersim('dataset/splits/hypersim/val.txt', 'val', size=size)
     elif args.dataset == 'vkitti':
         valset = KITTI('dataset/splits/kitti/val.txt', 'val', size=size)
+    elif args.dataset == 'custom':
+        val_split_file = 'dataset/splits_with_radar/val.txt'
+        valset = CustomDataset(val_split_file, height=args.img_size, width=args.img_size)
     else:
         raise NotImplementedError
     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
@@ -85,7 +100,7 @@ def main():
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
         'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     }
-    model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
+    model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth, 'fusion_type': args.fusion_type, 'radar_in_ch': 1})
     
     if args.pretrained_from:
         model.load_state_dict({k: v for k, v in torch.load(args.pretrained_from, map_location='cpu').items() if 'pretrained' in k}, strict=False)
@@ -129,8 +144,49 @@ def main():
                 valid_mask = valid_mask.flip(-1)
             
             pred = model(img)
-            
+
             loss = criterion(pred, depth, (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth))
+
+            # Optional radar-consistency loss: prefer radar from sample if present, else try --radar-dir matching
+            # radar consistency loss
+            radar_loss = torch.tensor(0.0, device=model.device)
+            if args.radar_consistency_weight > 0:
+                # Prefer radar data from the sample if available (from new data pipeline)
+                if 'radar_depth' in sample and 'radar_mask' in sample:
+                    radar_depths = sample['radar_depth'].cuda(local_rank, non_blocking=True)
+                    radar_masks = sample['radar_mask'].cuda(local_rank, non_blocking=True)
+                # Fallback to old logic if not in sample and --radar-dir is provided
+                elif args.radar_dir:
+                    # This part is now less likely to be used with the new data pipeline
+                    radar_depths = []
+                    radar_masks = []
+                    for fname in sample['filename']:
+                        radar_fname = 'radar_' + fname.split('.')[0] + '.mat'
+                        radar_fpath = os.path.join(args.radar_dir, radar_fname)
+                        if os.path.exists(radar_fpath):
+                            depth, mask = load_radar_mat(radar_fpath, resize_to=pred.shape[-2:])
+                            radar_depths.append(torch.from_numpy(depth))
+                            radar_masks.append(torch.from_numpy(mask))
+                        else:
+                            radar_depths.append(torch.zeros_like(pred[0]))
+                            radar_masks.append(torch.zeros_like(pred[0]))
+                    radar_depths = torch.stack(radar_depths).cuda(local_rank, non_blocking=True)
+                    radar_masks = torch.stack(radar_masks).cuda(local_rank, non_blocking=True)
+                else:
+                    radar_depths = None
+                    radar_masks = None
+
+                if radar_depths is not None and radar_masks is not None:
+                    # Resize radar to match prediction size if necessary
+                    if radar_depths.shape[-2:] != pred.shape[-2:]:
+                        radar_depths = F.interpolate(radar_depths, size=pred.shape[-2:], mode='nearest')
+                        radar_masks = F.interpolate(radar_masks, size=pred.shape[-2:], mode='nearest')
+                    
+                    mask_sum = torch.sum(radar_masks)
+                    if mask_sum > 0:
+                        radar_loss = F.mse_loss(pred[radar_masks > 0], radar_depths[radar_masks > 0]) * args.radar_consistency_weight
+            
+            loss = silog_loss(pred, depth) + radar_loss
             
             loss.backward()
             optimizer.step()
